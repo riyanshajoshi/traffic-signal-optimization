@@ -1,13 +1,16 @@
 import java.util.ArrayList;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.Random;
 
 public class DynamicTrafficSignalOptimization {
     private static final long EMERGENCY_BONUS = 10_000;
-    private static final long FAIRNESS_WEIGHT = 60;
+    private static final long FAIRNESS_WEIGHT = 75;
     private static final int MIN_GREEN_SECONDS = 10;
-    private static final int MAX_GREEN_SECONDS = 35;
+    private static final int MAX_GREEN_SECONDS = 45;
     private static final int SECONDS_PER_VEHICLE = 2;
+    private static final double EMERGENCY_PROBABILITY = 0.08;
+    private static final double BURST_PROBABILITY = 0.18;
 
     static class Lane {
         String name;
@@ -15,17 +18,20 @@ public class DynamicTrafficSignalOptimization {
         int waitingTime;
         boolean emergency;
         int skippedRounds;
-        int arrivalRate;
+        double normalArrivalMean;
+        double peakArrivalMean;
         int totalGreenTime;
         int vehiclesServed;
+        int totalArrivals;
         long accumulatedVehicleDelay;
 
-        Lane(String name, int vehicles, int waitingTime, boolean emergency, int arrivalRate) {
+        Lane(String name, double normalArrivalMean, double peakArrivalMean, Random random) {
             this.name = name;
-            this.vehicles = vehicles;
-            this.waitingTime = waitingTime;
-            this.emergency = emergency;
-            this.arrivalRate = arrivalRate;
+            this.normalArrivalMean = normalArrivalMean;
+            this.peakArrivalMean = peakArrivalMean;
+            this.vehicles = 4 + random.nextInt(16);
+            this.waitingTime = 10 + random.nextInt(80);
+            this.totalArrivals = this.vehicles;
         }
     }
 
@@ -42,6 +48,18 @@ public class DynamicTrafficSignalOptimization {
             this.waitingTime = waitingTime;
             this.vehicles = vehicles;
             this.emergency = emergency;
+        }
+    }
+
+    static class TrafficUpdate {
+        int arrivals;
+        boolean emergencyDetected;
+        boolean burstDetected;
+
+        TrafficUpdate(int arrivals, boolean emergencyDetected, boolean burstDetected) {
+            this.arrivals = arrivals;
+            this.emergencyDetected = emergencyDetected;
+            this.burstDetected = burstDetected;
         }
     }
 
@@ -92,6 +110,74 @@ public class DynamicTrafficSignalOptimization {
         return Math.min(MAX_GREEN_SECONDS, Math.max(MIN_GREEN_SECONDS, duration));
     }
 
+    private static List<Lane> createIntersection(Random random) {
+        List<Lane> lanes = new ArrayList<>();
+        lanes.add(new Lane("North", 3.8, 8.0, random));
+        lanes.add(new Lane("East", 2.2, 5.5, random));
+        lanes.add(new Lane("South", 3.0, 6.8, random));
+        lanes.add(new Lane("West", 1.8, 4.5, random));
+        return lanes;
+    }
+
+    private static void simulateSensorReadings(List<Lane> lanes, int cycle, Random random) {
+        System.out.println("Live sensor update before decision:");
+
+        for (Lane lane : lanes) {
+            boolean peakTraffic = isPeakCycle(cycle);
+            boolean burst = random.nextDouble() < BURST_PROBABILITY;
+            double mean = peakTraffic ? lane.peakArrivalMean : lane.normalArrivalMean;
+
+            if (burst) {
+                mean *= 1.9;
+            }
+
+            TrafficUpdate update = readLaneSensor(lane, mean, random);
+            update.burstDetected = burst;
+            applyIncomingTraffic(lane, update);
+
+            System.out.printf("- %-5s: +%2d vehicles%s%s%n",
+                    lane.name,
+                    update.arrivals,
+                    update.burstDetected ? " | sudden traffic burst" : "",
+                    update.emergencyDetected ? " | emergency detected" : "");
+        }
+    }
+
+    private static boolean isPeakCycle(int cycle) {
+        int position = cycle % 12;
+        return position >= 4 && position <= 8;
+    }
+
+    private static TrafficUpdate readLaneSensor(Lane lane, double meanArrivals, Random random) {
+        int arrivals = samplePoisson(meanArrivals, random);
+        boolean emergencyDetected = !lane.emergency
+                && arrivals > 0
+                && random.nextDouble() < EMERGENCY_PROBABILITY;
+        return new TrafficUpdate(arrivals, emergencyDetected, false);
+    }
+
+    private static void applyIncomingTraffic(Lane lane, TrafficUpdate update) {
+        lane.vehicles += update.arrivals;
+        lane.totalArrivals += update.arrivals;
+
+        if (update.emergencyDetected) {
+            lane.emergency = true;
+        }
+    }
+
+    private static int samplePoisson(double mean, Random random) {
+        double limit = Math.exp(-mean);
+        int count = 0;
+        double product = 1.0;
+
+        do {
+            count++;
+            product *= random.nextDouble();
+        } while (product > limit);
+
+        return count - 1;
+    }
+
     private static void printLaneTable(List<Lane> lanes) {
         System.out.printf("%-10s%10s%12s%12s%12s%14s%n",
                 "Lane", "Vehicles", "Wait(s)", "Skipped", "Emergency", "Priority");
@@ -108,16 +194,6 @@ public class DynamicTrafficSignalOptimization {
         }
     }
 
-    private static void addScheduledEmergency(List<Lane> lanes, int cycle) {
-        if (cycle == 4) {
-            lanes.get(3).emergency = true;
-            System.out.println("Event: Emergency vehicle detected in West lane.");
-        } else if (cycle == 7) {
-            lanes.get(2).emergency = true;
-            System.out.println("Event: Emergency vehicle detected in South lane.");
-        }
-    }
-
     private static void updateTrafficAfterGreen(List<Lane> lanes, int selectedIndex, int greenDuration) {
         for (int i = 0; i < lanes.size(); i++) {
             Lane lane = lanes.get(i);
@@ -130,44 +206,38 @@ public class DynamicTrafficSignalOptimization {
                 lane.vehicles -= served;
                 lane.vehiclesServed += served;
                 lane.totalGreenTime += greenDuration;
-                lane.waitingTime = 0;
+                lane.waitingTime = lane.vehicles == 0 ? 0 : greenDuration / 2;
                 lane.skippedRounds = 0;
-                lane.emergency = false;
+
+                if (served > 0) {
+                    lane.emergency = false;
+                }
             } else {
                 lane.waitingTime += greenDuration;
                 lane.skippedRounds++;
             }
-
-            lane.vehicles += lane.arrivalRate;
         }
     }
 
-    private static List<Lane> createDefaultIntersection() {
-        List<Lane> lanes = new ArrayList<>();
-        lanes.add(new Lane("North", 18, 40, false, 3));
-        lanes.add(new Lane("East", 7, 70, false, 1));
-        lanes.add(new Lane("South", 12, 25, false, 2));
-        lanes.add(new Lane("West", 4, 90, false, 1));
-        return lanes;
-    }
-
-    private static void runSimulation(int cycles) {
-        List<Lane> lanes = createDefaultIntersection();
+    private static void runSimulation(int cycles, Random random, String seedMessage) {
+        List<Lane> lanes = createIntersection(random);
 
         System.out.println("Dynamic Traffic Signal Optimization");
         System.out.println("Greedy Algorithm + Max Priority Queue");
         System.out.println("Priority = vehicles * waiting_time + emergency_bonus + fairness_factor");
+        System.out.println(seedMessage);
 
         for (int cycle = 1; cycle <= cycles; cycle++) {
             System.out.println("\n==================== Decision Cycle " + cycle + " ====================");
-            addScheduledEmergency(lanes, cycle);
+            simulateSensorReadings(lanes, cycle, random);
+            System.out.println();
             printLaneTable(lanes);
 
             PriorityQueue<Candidate> maxHeap = buildPriorityQueue(lanes);
 
             if (maxHeap.isEmpty()) {
                 System.out.println("No active traffic at the intersection.");
-                break;
+                continue;
             }
 
             Candidate selected = maxHeap.poll();
@@ -189,34 +259,38 @@ public class DynamicTrafficSignalOptimization {
 
     private static void printFinalSummary(List<Lane> lanes) {
         int totalServed = 0;
+        int totalArrivals = 0;
         int totalGreen = 0;
         long totalDelay = 0;
 
         System.out.println("\n==================== Final Summary ====================");
-        System.out.printf("%-10s%14s%16s%16s%18s%n",
-                "Lane", "Served", "Remaining", "Green(s)", "Delay Score");
-        printSeparator(74);
+        System.out.printf("%-10s%12s%12s%12s%14s%16s%n",
+                "Lane", "Arrivals", "Served", "Remaining", "Green(s)", "Delay Score");
+        printSeparator(76);
 
         for (Lane lane : lanes) {
             totalServed += lane.vehiclesServed;
+            totalArrivals += lane.totalArrivals;
             totalGreen += lane.totalGreenTime;
             totalDelay += lane.accumulatedVehicleDelay;
 
-            System.out.printf("%-10s%14d%16d%16d%18d%n",
+            System.out.printf("%-10s%12d%12d%12d%14d%16d%n",
                     lane.name,
+                    lane.totalArrivals,
                     lane.vehiclesServed,
                     lane.vehicles,
                     lane.totalGreenTime,
                     lane.accumulatedVehicleDelay);
         }
 
-        System.out.println("\nTotal vehicles served: " + totalServed);
+        System.out.println("\nTotal vehicles detected by sensors: " + totalArrivals);
+        System.out.println("Total vehicles served: " + totalServed);
         System.out.println("Total green time allocated: " + totalGreen + " seconds");
         System.out.println("Total vehicle-delay score: " + totalDelay);
         System.out.println("\nComplexity note:");
-        System.out.println("- Max lane retrieval uses a priority queue.");
-        System.out.println("- Heap construction from n lanes is O(n) in this simulation.");
-        System.out.println("- Extracting the selected lane is O(log n).");
+        System.out.println("- Priority is computed for n lanes in each cycle.");
+        System.out.println("- Building the max priority queue is O(n).");
+        System.out.println("- Extracting the highest-priority lane is O(log n).");
         System.out.println("- Space complexity is O(n).");
     }
 
@@ -245,8 +319,35 @@ public class DynamicTrafficSignalOptimization {
         return 10;
     }
 
+    private static Random createRandom(String[] args) {
+        if (args.length >= 2) {
+            try {
+                long seed = Long.parseLong(args[1]);
+                return new Random(seed);
+            } catch (NumberFormatException ignored) {
+                System.out.println("Invalid seed. Using system time instead.");
+            }
+        }
+
+        return new Random();
+    }
+
+    private static String seedMessage(String[] args) {
+        if (args.length >= 2) {
+            try {
+                Long.parseLong(args[1]);
+                return "Random seed: " + args[1] + " (repeatable run)";
+            } catch (NumberFormatException ignored) {
+                return "Random seed: system time (non-repeatable run)";
+            }
+        }
+
+        return "Random seed: system time (non-repeatable run)";
+    }
+
     public static void main(String[] args) {
         int cycles = parseCycles(args);
-        runSimulation(cycles);
+        Random random = createRandom(args);
+        runSimulation(cycles, random, seedMessage(args));
     }
 }
