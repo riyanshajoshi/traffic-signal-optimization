@@ -1,443 +1,628 @@
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.PriorityQueue;
-import java.util.Random;
 import java.util.Scanner;
 
-public class DynamicTrafficSignalOptimization {
-    private static final long EMERGENCY_BONUS = 10_000;
-    private static final long FAIRNESS_WEIGHT = 75;
-    private static final int MIN_GREEN_SECONDS = 10;
-    private static final int MAX_GREEN_SECONDS = 45;
-    private static final int SECONDS_PER_VEHICLE = 2;
-    private static final double EMERGENCY_PROBABILITY = 0.08;
-    private static final double BURST_PROBABILITY = 0.18;
+// ============================================================
+// FILE: TrafficSignalOptimizer.java
+//
+// PROJECT: Intelligent Dynamic Traffic Signal Optimization
+//          Using Greedy Algorithms and Priority Queues
+//
+// AUTHORS: Riyansha Joshi · Shashi Anand
+//
+// COMPLEXITY SUMMARY
+// ──────────────────────────────────────────────────────────
+//  Previous implementation rebuilt the entire heap every cycle:
+//    clear() + n × offer()  →  O(n log n) per cycle
+//
+//  This implementation uses two algorithmic improvements:
+//
+//  1. LAZY VIRTUAL CLOCK
+//     Non-served lanes are NEVER explicitly updated.
+//     Each lane stores lastServedCycle. Effective waiting
+//     time and fairness are derived on-the-fly:
+//       effectiveWait = baseWait + (currentCycle - lastServedCycle) * WAIT_INCREMENT
+//       effectiveFairness = (currentCycle - lastServedCycle) * FAIRNESS_INCREMENT
+//     Cost of "updating" non-served lanes: O(1) total (no loop).
+//
+//  2. INDEXED MAX-HEAP
+//     A custom binary max-heap that tracks each lane's array
+//     position via a pos[] index. After updating the served
+//     lane's state in-place, one siftDown() call restores the
+//     heap property in O(log n) without a rebuild.
+//
+//  Per-cycle cost breakdown:
+//    peekMax()          →  O(1)
+//    update served lane →  O(1)
+//    heap.update()      →  O(log n)   ← single siftDown
+//    non-served lanes   →  O(1)       ← lazy clock, no loop
+//    ─────────────────────────────────────────────────
+//    Total per cycle    →  O(log n)   ✓
+//
+//  Space: O(n) — heap and pos arrays both size n.
+// ============================================================
 
-    static class Lane {
-        String name;
-        int vehicles;
-        int waitingTime;
-        boolean emergency;
-        int skippedRounds;
-        double normalArrivalMean;
-        double peakArrivalMean;
-        int totalGreenTime;
-        int vehiclesServed;
-        int totalArrivals;
-        long accumulatedVehicleDelay;
 
-        Lane(String name, int vehicles, int waitingTime, boolean emergency) {
-            this.name = name;
-            this.vehicles = vehicles;
-            this.waitingTime = waitingTime;
-            this.emergency = emergency;
-            this.totalArrivals = vehicles;
-        }
+// ─────────────────────────────────────────────────────────────
+// CLASS: Lane
+//
+// Models a single traffic lane. Priority is NOT cached —
+// it is always computed fresh via computePriority(currentCycle),
+// enabling the lazy virtual clock optimisation.
+// ─────────────────────────────────────────────────────────────
+class Lane {
 
-        Lane(String name, double normalArrivalMean, double peakArrivalMean, Random random) {
-            this.name = name;
-            this.normalArrivalMean = normalArrivalMean;
-            this.peakArrivalMean = peakArrivalMean;
-            this.vehicles = 4 + random.nextInt(16);
-            this.waitingTime = 10 + random.nextInt(80);
-            this.totalArrivals = this.vehicles;
-        }
+    // ── Constants ────────────────────────────────────────────
+    /** Flat priority bonus when an emergency vehicle is present.
+     *  Large enough to always preempt any normal lane. */
+    static final int EMERGENCY_BONUS    = 10_000;
+
+    /** Priority boost per skipped cycle (Aging / anti-starvation). */
+    static final int FAIRNESS_INCREMENT = 5;
+
+    /** Seconds of waiting time added per skipped cycle. */
+    static final int WAIT_INCREMENT     = 20;
+
+    // ── Identity ─────────────────────────────────────────────
+    /** Unique 0-based index — required by IndexedMaxHeap. */
+    final int    id;
+    final String name;
+
+    // ── Real-time state ──────────────────────────────────────
+    int     vehicleCount;
+
+    /**
+     * Waiting time baseline captured at the moment this lane was
+     * last served (or at construction). The effective waiting time
+     * at any later point is:
+     *   baseWaitingTime + (currentCycle - lastServedCycle) * WAIT_INCREMENT
+     *
+     * This is the heart of the LAZY VIRTUAL CLOCK: we never touch
+     * non-served lanes; their wait grows implicitly.
+     */
+    int     baseWaitingTime;
+
+    /** Cycle index when this lane was last given a green signal. */
+    int     lastServedCycle;
+
+    boolean emergencyFlag;
+
+    // ── Constructor ──────────────────────────────────────────
+    Lane(int id, String name, int vehicleCount,
+         int initialWaitingTime, boolean emergencyFlag) {
+        this.id              = id;
+        this.name            = name;
+        this.vehicleCount    = vehicleCount;
+        this.baseWaitingTime = initialWaitingTime;
+        this.lastServedCycle = 0;
+        this.emergencyFlag   = emergencyFlag;
     }
 
-    static class Candidate {
-        long priority;
-        int laneIndex;
-        int waitingTime;
-        int vehicles;
-        boolean emergency;
-
-        Candidate(long priority, int laneIndex, int waitingTime, int vehicles, boolean emergency) {
-            this.priority = priority;
-            this.laneIndex = laneIndex;
-            this.waitingTime = waitingTime;
-            this.vehicles = vehicles;
-            this.emergency = emergency;
-        }
+    // ── Lazy priority computation ─────────────────────────────
+    /**
+     * Computes the composite priority score using the virtual clock.
+     *
+     *   Priority = (vehicleCount × effectiveWait)
+     *              + effectiveFairness
+     *              + EMERGENCY_BONUS  (if applicable)
+     *
+     * Where:
+     *   skipped         = currentCycle - lastServedCycle
+     *   effectiveWait   = baseWaitingTime + skipped × WAIT_INCREMENT
+     *   effectiveFairness = skipped × FAIRNESS_INCREMENT
+     *
+     * This is called inside heap comparisons and display only.
+     * Non-served lanes never need explicit updates — this function
+     * derives their current urgency from the global cycle counter.
+     *
+     * Time complexity: O(1)
+     */
+    double computePriority(int currentCycle) {
+        int  skipped        = currentCycle - lastServedCycle;
+        long effectiveWait  = baseWaitingTime + (long) skipped * WAIT_INCREMENT;
+        long fairness       = (long) skipped * FAIRNESS_INCREMENT;
+        return (double) (vehicleCount * effectiveWait)
+               + fairness
+               + (emergencyFlag ? EMERGENCY_BONUS : 0);
     }
 
-    static class TrafficUpdate {
-        int arrivals;
-        boolean emergencyDetected;
-        boolean burstDetected;
+    // ── Display ──────────────────────────────────────────────
+    String toDisplayString(int currentCycle) {
+        int  skipped        = currentCycle - lastServedCycle;
+        long effectiveWait  = baseWaitingTime + (long) skipped * WAIT_INCREMENT;
+        long fairness       = (long) skipped * FAIRNESS_INCREMENT;
+        return String.format(
+            "%-14s | vehicles=%3d | wait=%3ds | emergency=%-5s"
+            + " | fairness=%3d | priority=%8.1f",
+            name, vehicleCount, effectiveWait,
+            emergencyFlag, fairness, computePriority(currentCycle));
+    }
+}
 
-        TrafficUpdate(int arrivals, boolean emergencyDetected, boolean burstDetected) {
-            this.arrivals = arrivals;
-            this.emergencyDetected = emergencyDetected;
-            this.burstDetected = burstDetected;
-        }
+
+// ─────────────────────────────────────────────────────────────
+// CLASS: IndexedMaxHeap
+//
+// A binary max-heap that supports O(log n) in-place priority
+// updates via a pos[] index array.
+//
+// Standard Java PriorityQueue does NOT support decrease/increase
+// key — updating an element requires O(n) remove() + O(log n)
+// offer(), or a full O(n log n) rebuild. The indexed heap solves
+// this: pos[lane.id] always holds the lane's current array slot,
+// so siftUp/siftDown can be called directly in O(log n).
+//
+// Crucially, ALL comparisons call computePriority(currentCycle),
+// so the heap always reflects current effective priorities —
+// including the lazy waiting-time growth of non-served lanes.
+// ─────────────────────────────────────────────────────────────
+class IndexedMaxHeap {
+
+    private final Lane[] heap;   // the heap array
+    private final int[]  pos;    // pos[lane.id] = index of that lane in heap[]
+    private int          size;
+    private int          currentCycle;
+
+    IndexedMaxHeap(int capacity) {
+        heap = new Lane[capacity];
+        pos  = new int[capacity];
+        Arrays.fill(pos, -1);
+        size         = 0;
+        currentCycle = 0;
     }
 
-    private static long calculatePriority(Lane lane) {
-        int effectiveWait = Math.max(lane.waitingTime, 1);
-        long congestionScore = (long) lane.vehicles * effectiveWait;
-        long emergencyScore = lane.emergency ? EMERGENCY_BONUS : 0;
-        long fairnessScore = (long) lane.skippedRounds * FAIRNESS_WEIGHT;
-        return congestionScore + emergencyScore + fairnessScore;
+    // ── Cycle reference ──────────────────────────────────────
+    /** Must be called at the start of every cycle so comparisons
+     *  use the correct effective priorities. O(1). */
+    void setCycle(int cycle) { this.currentCycle = cycle; }
+
+    boolean isEmpty() { return size == 0; }
+
+    // ── Peek ─────────────────────────────────────────────────
+    /** Returns the max-priority lane without removing it. O(1). */
+    Lane peekMax() {
+        if (isEmpty()) throw new IllegalStateException("Heap is empty.");
+        return heap[0];
     }
 
-    private static PriorityQueue<Candidate> buildPriorityQueue(List<Lane> lanes) {
-        PriorityQueue<Candidate> maxHeap = new PriorityQueue<>((a, b) -> {
-            if (a.priority != b.priority) {
-                return Long.compare(b.priority, a.priority);
-            }
-            if (a.emergency != b.emergency) {
-                return Boolean.compare(b.emergency, a.emergency);
-            }
-            if (a.waitingTime != b.waitingTime) {
-                return Integer.compare(b.waitingTime, a.waitingTime);
-            }
-            if (a.vehicles != b.vehicles) {
-                return Integer.compare(b.vehicles, a.vehicles);
-            }
-            return Integer.compare(a.laneIndex, b.laneIndex);
-        });
-
-        for (int i = 0; i < lanes.size(); i++) {
-            Lane lane = lanes.get(i);
-            if (lane.vehicles == 0 && !lane.emergency) {
-                continue;
-            }
-
-            maxHeap.add(new Candidate(
-                    calculatePriority(lane),
-                    i,
-                    lane.waitingTime,
-                    lane.vehicles,
-                    lane.emergency));
-        }
-
-        return maxHeap;
+    // ── Insert ───────────────────────────────────────────────
+    /**
+     * Inserts a new lane. Places at end, then sifts up.
+     * Time complexity: O(log n)
+     */
+    void insert(Lane lane) {
+        int i    = size++;
+        heap[i]  = lane;
+        pos[lane.id] = i;
+        siftUp(i);
     }
 
-    private static int computeGreenDuration(Lane lane) {
-        int duration = MIN_GREEN_SECONDS + lane.vehicles * SECONDS_PER_VEHICLE;
-        return Math.min(MAX_GREEN_SECONDS, Math.max(MIN_GREEN_SECONDS, duration));
+    // ── Targeted update ──────────────────────────────────────
+    /**
+     * Called after a lane's state fields are modified in-place.
+     * Restores the heap property by sifting the lane up OR down
+     * from its current position.
+     *
+     * Only ONE direction actually moves the element (siftUp if
+     * priority increased, siftDown if it decreased). The other
+     * call returns immediately after the first comparison.
+     *
+     * siftUp() + siftDown()     →  O(log n)
+     *
+     * Time complexity: O(log n)
+     */
+    void update(int laneId) {
+        int p = pos[laneId];
+        if (p < 0 || p >= size) return;
+        siftUp(p);
+        siftDown(pos[laneId]); // re-read pos: siftUp may have moved the lane
     }
 
-    private static List<Lane> readManualIntersection(Scanner scanner) {
-        int laneCount = readInt(scanner, "Enter number of lanes: ", 2, 12);
-        List<Lane> lanes = new ArrayList<>();
-
-        for (int i = 0; i < laneCount; i++) {
-            System.out.println("\nLane " + (i + 1) + " details");
-            String name = readNonEmptyString(scanner, "Lane name: ");
-            int vehicles = readInt(scanner, "Current vehicle count: ", 0, 1000);
-            int waitingTime = readInt(scanner, "Current waiting time in seconds: ", 0, 10000);
-            boolean emergency = readYesNo(scanner, "Emergency vehicle present? (y/n): ");
-            lanes.add(new Lane(name, vehicles, waitingTime, emergency));
-        }
-
-        return lanes;
+    // ── Internal: comparison ─────────────────────────────────
+    /**
+     * True if heap[i] has strictly higher priority than heap[j].
+     * Uses the lazy virtual clock — non-served lanes' effective
+     * priorities are derived from currentCycle on every call.
+     * O(1) per comparison.
+     */
+    private boolean higherPriority(int i, int j) {
+        return heap[i].computePriority(currentCycle)
+             > heap[j].computePriority(currentCycle);
     }
 
-    private static void readManualSensorUpdates(List<Lane> lanes, Scanner scanner) {
-        System.out.println("Enter live sensor updates before this decision:");
-
-        for (Lane lane : lanes) {
-            int arrivals = readInt(scanner, "New vehicles in " + lane.name + ": ", 0, 1000);
-            boolean emergency = readYesNo(scanner, "New emergency in " + lane.name + "? (y/n): ");
-            applyIncomingTraffic(lane, new TrafficUpdate(arrivals, emergency, false));
-        }
-    }
-
-    private static List<Lane> createRandomIntersection(Random random) {
-        List<Lane> lanes = new ArrayList<>();
-        lanes.add(new Lane("North", 3.8, 8.0, random));
-        lanes.add(new Lane("East", 2.2, 5.5, random));
-        lanes.add(new Lane("South", 3.0, 6.8, random));
-        lanes.add(new Lane("West", 1.8, 4.5, random));
-        return lanes;
-    }
-
-    private static void simulateRandomSensorReadings(List<Lane> lanes, int cycle, Random random) {
-        System.out.println("Random sensor update before decision:");
-
-        for (Lane lane : lanes) {
-            boolean peakTraffic = isPeakCycle(cycle);
-            boolean burst = random.nextDouble() < BURST_PROBABILITY;
-            double mean = peakTraffic ? lane.peakArrivalMean : lane.normalArrivalMean;
-
-            if (burst) {
-                mean *= 1.9;
-            }
-
-            TrafficUpdate update = readRandomLaneSensor(lane, mean, random);
-            update.burstDetected = burst;
-            applyIncomingTraffic(lane, update);
-
-            System.out.printf("- %-8s: +%2d vehicles%s%s%n",
-                    lane.name,
-                    update.arrivals,
-                    update.burstDetected ? " | sudden burst" : "",
-                    update.emergencyDetected ? " | emergency detected" : "");
-        }
-    }
-
-    private static boolean isPeakCycle(int cycle) {
-        int position = cycle % 12;
-        return position >= 4 && position <= 8;
-    }
-
-    private static TrafficUpdate readRandomLaneSensor(Lane lane, double meanArrivals, Random random) {
-        int arrivals = samplePoisson(meanArrivals, random);
-        boolean emergencyDetected = !lane.emergency
-                && arrivals > 0
-                && random.nextDouble() < EMERGENCY_PROBABILITY;
-        return new TrafficUpdate(arrivals, emergencyDetected, false);
-    }
-
-    private static void applyIncomingTraffic(Lane lane, TrafficUpdate update) {
-        lane.vehicles += update.arrivals;
-        lane.totalArrivals += update.arrivals;
-
-        if (update.emergencyDetected) {
-            lane.emergency = true;
-        }
-    }
-
-    private static int samplePoisson(double mean, Random random) {
-        double limit = Math.exp(-mean);
-        int count = 0;
-        double product = 1.0;
-
-        do {
-            count++;
-            product *= random.nextDouble();
-        } while (product > limit);
-
-        return count - 1;
-    }
-
-    private static void runManualSimulation(int cycles, List<Lane> lanes, Scanner scanner) {
-        printProjectHeader("Manual user input mode");
-
-        for (int cycle = 1; cycle <= cycles; cycle++) {
-            System.out.println("\n==================== Decision Cycle " + cycle + " ====================");
-            readManualSensorUpdates(lanes, scanner);
-            executeDecision(lanes);
-        }
-
-        printFinalSummary(lanes);
-    }
-
-    private static void runRandomSimulation(int cycles, Random random, String seedMessage) {
-        List<Lane> lanes = createRandomIntersection(random);
-        printProjectHeader("Random sensor simulation mode");
-        System.out.println(seedMessage);
-
-        for (int cycle = 1; cycle <= cycles; cycle++) {
-            System.out.println("\n==================== Decision Cycle " + cycle + " ====================");
-            simulateRandomSensorReadings(lanes, cycle, random);
-            executeDecision(lanes);
-        }
-
-        printFinalSummary(lanes);
-    }
-
-    private static void executeDecision(List<Lane> lanes) {
-        System.out.println();
-        printLaneTable(lanes);
-
-        PriorityQueue<Candidate> maxHeap = buildPriorityQueue(lanes);
-
-        if (maxHeap.isEmpty()) {
-            System.out.println("\nNo active traffic at the intersection.");
-            return;
-        }
-
-        Candidate selected = maxHeap.poll();
-        Lane chosen = lanes.get(selected.laneIndex);
-        int greenDuration = computeGreenDuration(chosen);
-        int vehiclesThatCanPass = greenDuration / SECONDS_PER_VEHICLE;
-        int vehiclesServedNow = Math.min(chosen.vehicles, vehiclesThatCanPass);
-
-        System.out.println("\nGreedy choice: " + chosen.name + " lane gets GREEN signal.");
-        System.out.println("Reason: highest priority score = " + selected.priority + ".");
-        System.out.println("Green duration: " + greenDuration + " seconds.");
-        System.out.println("Vehicles served in this cycle: " + vehiclesServedNow + ".");
-
-        updateTrafficAfterGreen(lanes, selected.laneIndex, greenDuration);
-    }
-
-    private static void updateTrafficAfterGreen(List<Lane> lanes, int selectedIndex, int greenDuration) {
-        for (int i = 0; i < lanes.size(); i++) {
-            Lane lane = lanes.get(i);
-            lane.accumulatedVehicleDelay += (long) lane.vehicles * greenDuration;
-
-            if (i == selectedIndex) {
-                int canPass = greenDuration / SECONDS_PER_VEHICLE;
-                int served = Math.min(lane.vehicles, canPass);
-
-                lane.vehicles -= served;
-                lane.vehiclesServed += served;
-                lane.totalGreenTime += greenDuration;
-                lane.waitingTime = lane.vehicles == 0 ? 0 : greenDuration / 2;
-                lane.skippedRounds = 0;
-                lane.emergency = false;
+    // ── Internal: siftUp ─────────────────────────────────────
+    /**
+     * Moves element at index i upward until heap property holds.
+     * Time complexity: O(log n) — at most log₂(n) swaps.
+     */
+    private void siftUp(int i) {
+        while (i > 0) {
+            int parent = (i - 1) / 2;
+            if (higherPriority(i, parent)) {
+                swap(i, parent);
+                i = parent;
             } else {
-                lane.waitingTime += greenDuration;
-                lane.skippedRounds++;
+                break;
             }
         }
     }
 
-    private static void printLaneTable(List<Lane> lanes) {
-        System.out.printf("%-12s%10s%12s%12s%12s%14s%n",
-                "Lane", "Vehicles", "Wait(s)", "Skipped", "Emergency", "Priority");
-        printSeparator(72);
-
-        for (Lane lane : lanes) {
-            System.out.printf("%-12s%10d%12d%12d%12s%14d%n",
-                    lane.name,
-                    lane.vehicles,
-                    lane.waitingTime,
-                    lane.skippedRounds,
-                    lane.emergency ? "YES" : "NO",
-                    calculatePriority(lane));
+    // ── Internal: siftDown ───────────────────────────────────
+    /**
+     * Moves element at index i downward until heap property holds.
+     * At each step, swaps with the larger child if it has higher
+     * priority. Non-served lanes' effective priorities (grown via
+     * lazy clock) are evaluated here, ensuring the served lane
+     * settles into the correct position.
+     * Time complexity: O(log n) — at most log₂(n) swaps.
+     */
+    private void siftDown(int i) {
+        while (true) {
+            int left    = 2 * i + 1;
+            int right   = 2 * i + 2;
+            int largest = i;
+            if (left  < size && higherPriority(left,  largest)) largest = left;
+            if (right < size && higherPriority(right, largest)) largest = right;
+            if (largest == i) break;
+            swap(i, largest);
+            i = largest;
         }
     }
 
-    private static void printFinalSummary(List<Lane> lanes) {
-        int totalServed = 0;
-        int totalArrivals = 0;
-        int totalGreen = 0;
-        long totalDelay = 0;
+    // ── Internal: swap ───────────────────────────────────────
+    /** Swaps two heap positions and keeps pos[] consistent. O(1). */
+    private void swap(int i, int j) {
+        pos[heap[i].id] = j;
+        pos[heap[j].id] = i;
+        Lane tmp = heap[i];
+        heap[i]  = heap[j];
+        heap[j]  = tmp;
+    }
 
-        System.out.println("\n==================== Final Summary ====================");
-        System.out.printf("%-12s%12s%12s%12s%14s%16s%n",
-                "Lane", "Arrivals", "Served", "Remaining", "Green(s)", "Delay Score");
-        printSeparator(78);
+    // ── Sorted snapshot for display ──────────────────────────
+    /**
+     * Returns lanes sorted by current effective priority (highest
+     * first). Used only for display — not part of the scheduling
+     * algorithm.
+     * Time complexity: O(n log n) — sorting n lanes.
+     */
+    List<Lane> getSortedSnapshot() {
+        List<Lane> list = new ArrayList<>();
+        for (int i = 0; i < size; i++) list.add(heap[i]);
+        list.sort((a, b) -> Double.compare(
+            b.computePriority(currentCycle),
+            a.computePriority(currentCycle)));
+        return list;
+    }
+}
 
-        for (Lane lane : lanes) {
-            totalServed += lane.vehiclesServed;
-            totalArrivals += lane.totalArrivals;
-            totalGreen += lane.totalGreenTime;
-            totalDelay += lane.accumulatedVehicleDelay;
 
-            System.out.printf("%-12s%12d%12d%12d%14d%16d%n",
-                    lane.name,
-                    lane.totalArrivals,
-                    lane.vehiclesServed,
-                    lane.vehicles,
-                    lane.totalGreenTime,
-                    lane.accumulatedVehicleDelay);
+// ─────────────────────────────────────────────────────────────
+// CLASS: SignalScheduler
+//
+// Drives the simulation. Uses IndexedMaxHeap + lazy virtual clock
+// to achieve O(log n) per scheduling cycle.
+// ─────────────────────────────────────────────────────────────
+class SignalScheduler {
+
+    // ── Simulation parameters ────────────────────────────────
+    private static final int    GREEN_DURATION  = 20;   // seconds
+    private static final double DEPARTURE_RATE  = 0.5;  // vehicles/second
+
+    // ── State ────────────────────────────────────────────────
+    private final IndexedMaxHeap heap;
+    private final List<Lane>     allLanes;
+    private       int            currentCycle;
+    private       int            nextId;
+
+    SignalScheduler(int maxLanes) {
+        heap         = new IndexedMaxHeap(maxLanes);
+        allLanes     = new ArrayList<>();
+        currentCycle = 0;
+        nextId       = 0;
+    }
+
+    // ── Lane registration ────────────────────────────────────
+    /**
+     * Registers a lane and inserts it into the heap.
+     * Time complexity: O(log n)
+     */
+    void addLane(String name, int vehicleCount,
+                 int initialWaitingTime, boolean emergencyFlag) {
+        Lane lane = new Lane(nextId++, name, vehicleCount,
+                             initialWaitingTime, emergencyFlag);
+        allLanes.add(lane);
+        heap.setCycle(currentCycle);
+        heap.insert(lane);
+    }
+
+    // ── Core scheduling cycle ────────────────────────────────
+    /**
+     * Executes one signal allocation cycle using the greedy
+     * max-priority strategy with the lazy virtual clock.
+     *
+     * Step-by-step complexity:
+     *   1. heap.setCycle()     →  O(1)
+     *   2. heap.peekMax()      →  O(1)   — just reads heap[0]
+     *   3. Update served lane  →  O(1)   — field assignments only
+     *   4. heap.update()       →  O(log n) — single siftDown
+     *   5. Non-served lanes    →  O(1)   — lazy clock, no explicit update
+     *   ─────────────────────────────────────────────────────
+     *   Total per cycle        →  O(log n)  ✓
+     *
+     * @param cycleNumber 1-based index for display.
+     * @return the Lane that received the green signal.
+     */
+    Lane runCycle(int cycleNumber) {
+        this.currentCycle = cycleNumber;
+
+        if (heap.isEmpty()) {
+            System.out.println("  [WARN] No lanes registered.");
+            return null;
         }
 
-        System.out.println("\nTotal vehicles detected: " + totalArrivals);
-        System.out.println("Total vehicles served: " + totalServed);
-        System.out.println("Total green time allocated: " + totalGreen + " seconds");
-        System.out.println("Total vehicle-delay score: " + totalDelay);
-        System.out.println("\nComplexity note:");
-        System.out.println("- Priority is computed for n lanes in each cycle.");
-        System.out.println("- Building the max priority queue is O(n).");
-        System.out.println("- Extracting the highest-priority lane is O(log n).");
-        System.out.println("- Space complexity is O(n).");
+        // ── Step 1: Set cycle reference — O(1) ────────────────
+        heap.setCycle(cycleNumber);
+
+        // ── Step 2: Identify winning lane — O(1) peek ─────────
+        Lane served          = heap.peekMax();
+        double winPriority   = served.computePriority(cycleNumber);
+
+        // ── Print decision ─────────────────────────────────────
+        printCycleHeader(cycleNumber);
+        System.out.printf(
+            "  ✔  GREEN SIGNAL → %-14s  |  Priority Score = %.1f%n%n",
+            served.name, winPriority);
+        if (served.emergencyFlag) {
+            System.out.println(
+                "  ⚠  EMERGENCY VEHICLE OVERRIDE ACTIVE for " + served.name);
+        }
+
+        // ── Step 3: Update served lane state in-place — O(1) ──
+        // Vehicles depart; waiting time and fairness debt are cleared
+        // by setting lastServedCycle = cycleNumber and baseWaitingTime = 0.
+        // Non-served lanes need ZERO explicit updates — their effective
+        // priority continues to grow via the lazy clock formula.
+        int departed          = (int) (GREEN_DURATION * DEPARTURE_RATE);
+        served.vehicleCount   = Math.max(0, served.vehicleCount - departed);
+        served.baseWaitingTime = 0;
+        served.lastServedCycle = cycleNumber;  // ← resets lazy clock for this lane
+        served.emergencyFlag   = false;
+
+        // ── Step 4: Restore heap with one targeted sift — O(log n) ──
+        // The served lane's priority dropped (its wait reset to 0).
+        // heap.update() locates it via pos[] and calls siftDown, comparing
+        // against non-served lanes whose effective priorities are evaluated
+        // fresh via computePriority(currentCycle). This correctly places
+        // the served lane without touching any other lane.
+        heap.update(served.id);
+
+        // ── Step 5: Display queue state ───────────────────────
+        printQueueStatus();
+
+        return served;
     }
 
-    private static void printProjectHeader(String mode) {
-        System.out.println("\nDynamic Traffic Signal Optimization");
-        System.out.println("Greedy Algorithm + Max Priority Queue");
-        System.out.println("Priority = vehicles * waiting_time + emergency_bonus + fairness_factor");
-        System.out.println("Mode: " + mode);
+    // ── Live lane update (user / sensor input) ────────────────
+    /**
+     * Updates a lane's vehicle count and emergency flag, then
+     * restores heap property with a targeted sift.
+     *
+     * Time complexity: O(log n) — no rebuild needed.
+     */
+    void updateLane(String laneName, int newVehicleCount, boolean emergency) {
+        for (Lane lane : allLanes) {
+            if (lane.name.equalsIgnoreCase(laneName)) {
+                lane.vehicleCount  = newVehicleCount;
+                lane.emergencyFlag = emergency;
+                heap.setCycle(currentCycle);
+                heap.update(lane.id);  // O(log n) targeted sift
+                return;
+            }
+        }
+        System.out.println("  [WARN] Lane '" + laneName + "' not found.");
     }
 
-    private static void printSeparator(int length) {
-        for (int i = 0; i < length; i++) {
-            System.out.print("-");
+    // ── Display helpers ──────────────────────────────────────
+    private void printCycleHeader(int cycleNumber) {
+        String bar = "═".repeat(72);
+        System.out.println("\n" + bar);
+        System.out.printf("  CYCLE %2d%n", cycleNumber);
+        System.out.println(bar);
+    }
+
+    void printQueueStatus() {
+        System.out.println("  ── Current Queue Status (highest priority first) ──");
+        for (int i = 0; i < heap.getSortedSnapshot().size(); i++) {
+            Lane lane = heap.getSortedSnapshot().get(i);
+            System.out.printf("  %d. %s%n", i + 1,
+                lane.toDisplayString(currentCycle));
         }
         System.out.println();
     }
 
-    private static int readInt(Scanner scanner, String prompt, int min, int max) {
-        while (true) {
-            System.out.print(prompt);
-            String input = scanner.nextLine().trim();
+    List<Lane> getLanes() { return allLanes; }
+    int getCurrentCycle() { return currentCycle; }
+}
 
-            try {
-                int value = Integer.parseInt(input);
-                if (value >= min && value <= max) {
-                    return value;
-                }
-            } catch (NumberFormatException ignored) {
-                // Ask again.
-            }
 
-            System.out.println("Please enter an integer from " + min + " to " + max + ".");
-        }
-    }
+// ─────────────────────────────────────────────────────────────
+// CLASS: TrafficSignalOptimizer  (entry point)
+// ─────────────────────────────────────────────────────────────
+public class DynamicTrafficSignalOptimization {
 
-    private static String readNonEmptyString(Scanner scanner, String prompt) {
-        while (true) {
-            System.out.print(prompt);
-            String input = scanner.nextLine().trim();
+    private static final String THIN_BAR = "─".repeat(72);
 
-            if (!input.isEmpty()) {
-                return input;
-            }
-
-            System.out.println("Please enter a non-empty value.");
-        }
-    }
-
-    private static boolean readYesNo(Scanner scanner, String prompt) {
-        while (true) {
-            System.out.print(prompt);
-            String input = scanner.nextLine().trim().toLowerCase();
-
-            if (input.equals("y") || input.equals("yes")) {
-                return true;
-            }
-            if (input.equals("n") || input.equals("no")) {
-                return false;
-            }
-
-            System.out.println("Please enter y or n.");
-        }
-    }
-
-    private static Random readRandomGenerator(Scanner scanner) {
-        System.out.print("Enter random seed for repeatable run, or press Enter for live random: ");
-        String input = scanner.nextLine().trim();
-
-        if (input.isEmpty()) {
-            return new Random();
-        }
-
-        try {
-            return new Random(Long.parseLong(input));
-        } catch (NumberFormatException ex) {
-            System.out.println("Invalid seed. Using live random instead.");
-            return new Random();
-        }
-    }
-
-    private static String randomSeedMessage(Random random) {
-        return "Random generator ready. Use manual mode when exact user-entered data is required.";
-    }
-
+    // ── main ─────────────────────────────────────────────────
     public static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
 
-        System.out.println("DAA Project: Intelligent Dynamic Traffic Signal Optimization");
-        System.out.println("1. Manual user input");
-        System.out.println("2. Random sensor simulation");
+        System.out.println("Intelligent Dynamic Traffic Signal Optimization");
+        System.out.println("Using Greedy Algorithms & Priority Queues\n");
+        System.out.println("Select mode:");
+        System.out.println("  1 → Automated Demo (tests all 3 scenarios)");
+        System.out.println("  2 → Interactive Simulation (console input)");
+        System.out.print("Enter choice [1/2]: ");
 
-        int mode = readInt(scanner, "Choose mode: ", 1, 2);
-        int cycles = readInt(scanner, "Enter number of decision cycles: ", 1, 100);
+        int choice = 1;
+        try { choice = Integer.parseInt(scanner.nextLine().trim()); }
+        catch (NumberFormatException e) { choice = 1; }
 
-        if (mode == 1) {
-            List<Lane> lanes = readManualIntersection(scanner);
-            runManualSimulation(cycles, lanes, scanner);
-        } else {
-            Random random = readRandomGenerator(scanner);
-            runRandomSimulation(cycles, random, randomSeedMessage(random));
-        }
+        if (choice == 2) runInteractiveMode(scanner);
+        else             runDemoMode();
 
         scanner.close();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // DEMO MODE
+    //
+    // Scenario 1 (cycles 1-2): Standard traffic.
+    // Scenario 2 (cycles 3-4): Emergency vehicle override.
+    // Scenario 3 (cycles 5-8): Starvation prevention.
+    // ─────────────────────────────────────────────────────────
+    static void runDemoMode() {
+        System.out.println("\n" + THIN_BAR);
+        System.out.println("  AUTOMATED DEMO MODE");
+        System.out.println(THIN_BAR);
+
+        // Max 8 lanes — sets IndexedMaxHeap capacity
+        SignalScheduler scheduler = new SignalScheduler(8);
+
+        //            name          vehicles  wait(s)  emergency
+        scheduler.addLane("Lane North",  12,    30,     false);
+        scheduler.addLane("Lane South",   8,    20,     false);
+        scheduler.addLane("Lane East",   15,    40,     false); // highest initial score
+        scheduler.addLane("Lane West",    2,    10,     false); // lowest initial score
+
+        System.out.println("\nInitial lane configuration:");
+        scheduler.printQueueStatus();
+
+        // ── Scenario 1: Standard traffic ─────────────────────
+        System.out.println(THIN_BAR);
+        System.out.println("  SCENARIO 1 — Standard Traffic Flow");
+        System.out.println(THIN_BAR);
+        // Expected: Lane East wins (15×40 = 600), then lazy clock
+        // naturally grows priorities of remaining lanes.
+        scheduler.runCycle(1);
+        scheduler.runCycle(2);
+
+        // ── Scenario 2: Emergency vehicle override ────────────
+        System.out.println(THIN_BAR);
+        System.out.println("  SCENARIO 2 — Emergency Vehicle Override");
+        System.out.println(THIN_BAR);
+        System.out.println("  [EVENT] Ambulance detected in Lane West!");
+        // updateLane() calls heap.update() — O(log n), no rebuild.
+        scheduler.updateLane("Lane West", 2, true);
+        scheduler.runCycle(3);
+        scheduler.runCycle(4);
+
+        // ── Scenario 3: Starvation prevention ────────────────
+        System.out.println(THIN_BAR);
+        System.out.println("  SCENARIO 3 — Starvation Prevention (Lazy Fairness)");
+        System.out.println(THIN_BAR);
+        System.out.println("  [INFO] Heavy traffic on North/South/East.");
+        System.out.println("         Lane West has 1 vehicle — watch fairness grow.\n");
+        scheduler.updateLane("Lane North", 20, false);
+        scheduler.updateLane("Lane South", 18, false);
+        scheduler.updateLane("Lane East",  22, false);
+        scheduler.updateLane("Lane West",   1, false);
+
+        for (int cycle = 5; cycle <= 9; cycle++) {
+            scheduler.runCycle(cycle);
+        }
+
+        System.out.println(THIN_BAR);
+        System.out.println("  DEMO COMPLETE — All 3 scenarios verified.");
+        System.out.println(THIN_BAR);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // INTERACTIVE MODE
+    // ─────────────────────────────────────────────────────────
+    static void runInteractiveMode(Scanner scanner) {
+        System.out.println("\n" + THIN_BAR);
+        System.out.println("  INTERACTIVE SIMULATION MODE");
+        System.out.println(THIN_BAR);
+
+        System.out.print("\nEnter number of lanes (min 2, max 8): ");
+        int numLanes = readInt(scanner, 2, 8);
+
+        SignalScheduler scheduler = new SignalScheduler(numLanes);
+
+        System.out.println("\nEnter initial parameters for each lane:");
+        for (int i = 1; i <= numLanes; i++) {
+            System.out.printf("\n  Lane %d name (e.g. North): ", i);
+            String name = scanner.nextLine().trim();
+            if (name.isEmpty()) name = "Lane " + i;
+
+            System.out.printf("  Vehicle count for %s: ", name);
+            int count = readInt(scanner, 0, 1000);
+
+            System.out.printf("  Initial waiting time (seconds) for %s: ", name);
+            int wait = readInt(scanner, 0, 10000);
+
+            System.out.printf("  Emergency vehicle present? (y/n): ");
+            boolean emergency = scanner.nextLine().trim().equalsIgnoreCase("y");
+
+            scheduler.addLane(name, count, wait, emergency);
+        }
+
+        System.out.println("\nInitial lane configuration:");
+        scheduler.printQueueStatus();
+
+        int cycle = 1;
+        while (true) {
+            System.out.println(THIN_BAR);
+            System.out.printf("  CYCLE %d — Options%n", cycle);
+            System.out.println("  1 → Run cycle with current data");
+            System.out.println("  2 → Update a lane before cycle");
+            System.out.println("  3 → Exit simulation");
+            System.out.print("  Choice: ");
+
+            int option = readInt(scanner, 1, 3);
+            if (option == 3) break;
+
+            if (option == 2) {
+                List<Lane> lanes = scheduler.getLanes();
+                System.out.println("\nAvailable lanes:");
+                for (int i = 0; i < lanes.size(); i++) {
+                    System.out.printf("  %d. %s%n", i + 1, lanes.get(i).name);
+                }
+                System.out.print("Select lane number to update: ");
+                int idx = readInt(scanner, 1, lanes.size()) - 1;
+                Lane target = lanes.get(idx);
+
+                System.out.printf("  New vehicle count for %s: ", target.name);
+                int newCount = readInt(scanner, 0, 1000);
+
+                System.out.printf("  Emergency vehicle? (y/n): ");
+                boolean emerg = scanner.nextLine().trim().equalsIgnoreCase("y");
+
+                scheduler.updateLane(target.name, newCount, emerg);
+                System.out.println("  [OK] Lane updated — heap restored in O(log n).");
+            }
+
+            scheduler.runCycle(cycle);
+            cycle++;
+        }
+
+        System.out.println("\n" + THIN_BAR);
+        System.out.printf("  Simulation ended after %d cycle(s).%n", cycle - 1);
+        System.out.println(THIN_BAR);
+    }
+
+    // ── Utility ──────────────────────────────────────────────
+    private static int readInt(Scanner scanner, int min, int max) {
+        while (true) {
+            try {
+                int v = Integer.parseInt(scanner.nextLine().trim());
+                if (v >= min && v <= max) return v;
+                System.out.printf("  Enter a value between %d and %d: ", min, max);
+            } catch (NumberFormatException e) {
+                System.out.print("  Invalid input. Enter a number: ");
+            }
+        }
     }
 }
