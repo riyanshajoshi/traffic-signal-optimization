@@ -1,6 +1,7 @@
 # 🚦 Intelligent Dynamic Traffic Signal Optimization
 ### Using Greedy Algorithms & Priority Queues
-  
+
+ 
 > **Language:** Java 11+  
 > **Dependencies:** `java.util` only — no external libraries
 
@@ -171,28 +172,34 @@ For k cycles across n lanes: **O(k log n)** overall.
 traffic-signal-optimizer/
 │
 ├── src/
-│   ├── Main.java               ← Entry point only; delegates to Simulation
-│   ├── Vehicle.java            ← Base class: id, waitingTime
-│   ├── EmergencyVehicle.java   ← Extends Vehicle; ServiceType enum (AMBULANCE, FIRE_TRUCK, POLICE)
-│   ├── TrafficSignal.java      ← Signal state machine: RED / GREEN / YELLOW
-│   ├── Lane.java               ← Core lane model; lazy clock; priority formula
-│   ├── Scheduler.java          ← Indexed max-heap; O(log n) insert + update
-│   └── Simulation.java         ← Orchestration; demo and interactive modes
+│   ├── model/
+│   │   ├── Vehicle.java            ← Base class: id, waitingTime
+│   │   ├── EmergencyVehicle.java   ← Extends Vehicle; ServiceType enum (AMBULANCE, FIRE_TRUCK, POLICE)
+│   │   ├── TrafficSignal.java      ← Signal state machine: RED / GREEN / YELLOW
+│   │   └── Lane.java               ← Core lane model; lazy clock; priority formula
+│   │
+│   ├── scheduler/
+│   │   └── Scheduler.java          ← Indexed max-heap; O(log n) insert + update
+│   │
+│   ├── simulation/
+│   │   └── Simulation.java         ← Orchestration; demo and interactive modes
+│   │
+│   └── Main.java                   ← Entry point only; delegates to Simulation
 │
 └── README.md
 ```
 
 **Responsibility of each class:**
 
-| File | Responsibility |
-|---|---|
-| `Main.java` | Parse mode choice, delegate to `Simulation` |
-| `Vehicle.java` | Track individual vehicle ID and wait time |
-| `EmergencyVehicle.java` | Extend `Vehicle` with a `ServiceType`; triggers priority bonus |
-| `TrafficSignal.java` | Own signal state (RED/GREEN/YELLOW) and green duration config |
-| `Lane.java` | Hold vehicle count, signal, lazy clock anchors; compute priority in O(1) |
-| `Scheduler.java` | Indexed max-heap — pure algorithm, no I/O |
-| `Simulation.java` | Wire everything together; manage lane list; print results; run scenarios |
+| Package | File | Responsibility |
+|---|---|---|
+| `model` | `Vehicle.java` | Track individual vehicle ID and wait time |
+| `model` | `EmergencyVehicle.java` | Extend `Vehicle` with a `ServiceType`; triggers priority bonus |
+| `model` | `TrafficSignal.java` | Own signal state (RED/GREEN/YELLOW) and green duration config |
+| `model` | `Lane.java` | Hold vehicle count, signal, lazy clock anchors; compute priority in O(1) |
+| `scheduler` | `Scheduler.java` | Indexed max-heap — pure algorithm, no I/O |
+| `simulation` | `Simulation.java` | Wire everything together; manage lane list; print results; run scenarios |
+| *(default)* | `Main.java` | Parse mode choice, delegate to `Simulation` |
 
 ---
 
@@ -210,11 +217,11 @@ traffic-signal-optimizer/
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/traffic-signal-optimizer.git
-cd traffic-signal-optimizer
+git clone https://github.com/riyanshajoshi/traffic-signal-optimization.git
+cd traffic-signal-optimization
 
 # Compile all source files into out/
-javac -d out src/*.java
+javac -d out src/Main.java src/model/*.java src/scheduler/*.java src/simulation/*.java
 
 # Run
 java -cp out Main
