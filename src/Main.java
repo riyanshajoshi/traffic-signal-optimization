@@ -1,3 +1,4 @@
+package src;
 // ============================================================
 // Main.java
 //
@@ -13,7 +14,6 @@ public class Main {
 
         System.out.println("Intelligent Dynamic Traffic Signal Optimization");
         System.out.println("Using Greedy Algorithms & Priority Queues");
-        System.out.println("Authors: Riyansha Joshi · Shashi Anand\n");
 
         System.out.println("Select mode:");
         System.out.println("  1 → Automated Demo");
