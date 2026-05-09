@@ -67,15 +67,15 @@ Total per cycle                                         → O(log n) ✓
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                  INDEXED MAX-HEAP                         │
-│                                                           │
+│                  INDEXED MAX-HEAP                        │
+│                                                          │
 │  heap[]   [ Lane East | Lane North | Lane South | ... ]  │
-│  pos[]    [ id=0→idx  | id=1→idx  | id=2→idx  | ... ]   │
-│                                                           │
+│  pos[]    [ id=0→idx  | id=1→idx  | id=2→idx  | ... ]    │
+│                                                          │
 │  peekMax()  →  O(1)      reads heap[0]                   │
 │  update(id) →  O(log n)  pos[id] locates lane instantly, │
-│                           then a single siftDown restores │
-│                           order without any rebuild       │
+│                           then a single siftDown restores│
+│                           order without any rebuild      │
 └──────────────────────────────────────────────────────────┘
 ```
 
